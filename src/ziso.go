@@ -17,25 +17,28 @@ const __author__ = "IranEG"
 
 const ZISO_MAGIC = 0x4F53495A
 
-var DEFAULT_ALIGN int
-var COMPRESS_THRESHOLD int
 var DEFAULT_PADDING byte
+var DEFAULT_ALIGN int
 var MP bool
 
 const MP_NR = 1024 * 16
 
 func parse_args() (int, string, string) {
+
 	var fname_in string
 	var fname_out string
 
-	level := *getopt.IntLong("compress", 'c', 1, "value: 1-9 compress ISO to ZSO, use any non-zero number it has no effect\n              0 decompress ZSO to ISO")
-	MP = *getopt.BoolLong("multiproc", 'm', "Use multiprocessing acceleration for compressing")
-	COMPRESS_THRESHOLD = *getopt.IntLong("threshold", 't', 100, "percent Compression Threshold (1-100)")
-	DEFAULT_ALIGN = *getopt.IntLong("align", 'a', 0, "value: Padding alignment 0=small/slow 6=fast/large")
-	padding := *getopt.StringLong("padding", 'p', "X", "value: Padding byte")
+	level := getopt.IntLong("compress", 'c', 1, "value: 1-9 compress ISO to ZSO, use any non-zero number it has no effect\n              0 decompress ZSO to ISO")
+	mp := getopt.BoolLong("multiproc", 'm', "Use multiprocessing acceleration for compressing")
+	compress_threshold := getopt.IntLong("threshold", 't', 100, "percent Compression Threshold (1-100)")
+	default_align := getopt.IntLong("align", 'a', 0, "value: Padding alignment 0=small/slow 6=fast/large")
+	padding := getopt.StringLong("padding", 'p', "X", "value: Padding byte")
 	help := getopt.BoolLong("help", 'h', "Help")
 
 	getopt.ParseV2()
+
+	DEFAULT_ALIGN = *default_align
+	MP = *mp
 
 	args := getopt.NArgs()
 
@@ -49,28 +52,28 @@ func parse_args() (int, string, string) {
 		os.Exit(0)
 	}
 
-	if (level > 9) && (level < 1) {
-		fmt.Printf("!!!Error: out of bounds value for compress!!!\n\n")
+	if (*level > 9) && (*level < 0) {
+		fmt.Printf("ERROR: out of bounds value for compress!!!\n\n")
 		getopt.Usage()
 		os.Exit(1)
 	}
 
-	if (COMPRESS_THRESHOLD > 100) && (COMPRESS_THRESHOLD < 0) {
-		fmt.Printf("!!!Error: out of bounds value for threshold!!!\n\n")
+	if (*compress_threshold > 100) && (*compress_threshold < 0) {
+		fmt.Printf("ERROR: out of bounds value for threshold!!!\n\n")
 		getopt.Usage()
 		os.Exit(1)
 	}
 
 	if (args < 1) || (args > 2) {
-		fmt.Printf("!!!Error: Invalid amount of input and output file parameters!!!\n\n")
+		fmt.Printf("ERROR: Invalid amount of input and output file parameters!!!\n\n")
 		getopt.Usage()
 		os.Exit(1)
 	}
 
-	if len(padding) == 1 {
-		DEFAULT_PADDING = ([]byte(padding))[0]
+	if len(*padding) == 1 {
+		DEFAULT_PADDING = ([]byte(*padding))[0]
 	} else {
-		fmt.Printf("!!!Error: Invalid padding character!!!\n\n")
+		fmt.Printf("ERROR: Invalid padding character!!!\n\n")
 		getopt.Usage()
 		os.Exit(1)
 	}
@@ -79,8 +82,11 @@ func parse_args() (int, string, string) {
 		if strings.Contains(getopt.Arg(0), ".iso") {
 			fname_in = getopt.Arg(0)
 			fname_out = strings.Replace(getopt.Arg(0), ".iso", ".zso", 1)
+		} else if strings.Contains(getopt.Arg(0), ".zso") {
+			fname_in = getopt.Arg(0)
+			fname_out = strings.Replace(getopt.Arg(0), ".zso", ".iso", 1)
 		} else {
-			fmt.Printf("!!!Error: Invalid file extension!!!\n\n")
+			fmt.Printf("ERROR: Invalid file extension!!!\n\n")
 			getopt.Usage()
 			os.Exit(1)
 		}
@@ -90,14 +96,17 @@ func parse_args() (int, string, string) {
 		if strings.Contains(getopt.Arg(0), ".iso") && (strings.Contains(getopt.Arg(1), ".zso")) {
 			fname_in = getopt.Arg(0)
 			fname_out = getopt.Arg(1)
+		} else if strings.Contains(getopt.Arg(0), ".zso") && strings.Contains(getopt.Arg(1), ".iso") {
+			fname_in = getopt.Arg(0)
+			fname_out = getopt.Arg(1)
 		} else {
-			fmt.Printf("!!!Error: Invalid file extension!!!\n\n")
+			fmt.Printf("ERROR: Invalid file extension!!!\n\n")
 			getopt.Usage()
 			os.Exit(1)
 		}
 	}
 
-	return level, fname_in, fname_out
+	return *level, fname_in, fname_out
 }
 
 func open_input_output(fname_in string, fname_out string) (*os.File, *os.File) {
@@ -132,6 +141,33 @@ func generate_zso_header(magic int, header_size int, total_bytes int64, block_si
 	binary.Write(buf, binary.LittleEndian, dataIn)
 
 	return buf.Bytes()
+}
+
+func seek_and_read(fin *os.File, offset int64, size int) []byte {
+	read_data := make([]byte, size)
+	fin.Seek(offset, 0)
+	fin.Read(read_data)
+	return read_data
+}
+
+func read_zso_header(fin *os.File) (int, int, int64, int, int, int) {
+	type packet struct {
+		Magic       uint32
+		Header_size uint32
+		Total_bytes uint64
+		Block_size  uint32
+		Ver         byte
+		Align       byte
+		Pad_byte1   byte
+		Pad_byte2   byte
+	}
+
+	var dataIn packet
+	zso_data := seek_and_read(fin, 0, 0x18)
+	buf := bytes.NewReader(zso_data)
+	binary.Read(buf, binary.LittleEndian, &dataIn)
+
+	return int(dataIn.Magic), int(dataIn.Header_size), int64(dataIn.Total_bytes), int(dataIn.Block_size), int(dataIn.Ver), int(dataIn.Align)
 }
 
 func pack(int_byte int32) []byte {
@@ -266,7 +302,22 @@ func compress_zso(fname_in string, fname_out string, level int) {
 
 }
 
-func decompress_zso(fname_in string, fname_out string)
+func decompress_zso(fname_in string, fname_out string) {
+	fin, fout := open_input_output(fname_in, fname_out)
+
+	magic, header_size, total_bytes, block_size, ver, align := read_zso_header(fin)
+
+	if magic != ZISO_MAGIC || block_size == 0 || total_bytes == 0 || header_size != 24 || ver > 1 {
+		fmt.Println("ERROR: ZISO file format error!")
+		fmt.Println("\tInvalid file header!")
+		os.Exit(-1)
+	}
+
+	total_block := total_bytes / int64(block_size)
+
+	fin.Close()
+	fout.Close()
+}
 
 func main() {
 	fmt.Printf("ziso-go %s by %s\n", __version__, __author__)

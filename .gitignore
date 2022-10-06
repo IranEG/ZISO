@@ -19,5 +19,7 @@
 
 # Go workspace file
 go.work
-src/ziso.py
+*.py
 src/main
+*.zso
+*.iso
