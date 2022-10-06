@@ -23,17 +23,17 @@ var MP bool
 
 const MP_NR = 1024 * 16
 
-func parse_args() (int, string, string) {
+func parse_args() (lz4.CompressionLevel, string, string) {
 
 	var fname_in string
 	var fname_out string
 
-	level := getopt.IntLong("compress", 'c', 1, "value: 1-9 compress ISO to ZSO, use any non-zero number it has no effect\n              0 decompress ZSO to ISO")
+	level := getopt.IntLong("compress", 'c', 1, "1-9: MAX compression depth limit and compress ISO to ZSO,\n  0: No MAX depth limit\n -1: Decompress ZSO to ISO")
 	mp := getopt.BoolLong("multiproc", 'm', "Use multiprocessing acceleration for compressing")
-	compress_threshold := getopt.IntLong("threshold", 't', 100, "percent Compression Threshold (1-100)")
-	default_align := getopt.IntLong("align", 'a', 0, "value: Padding alignment 0=small/slow 6=fast/large")
-	padding := getopt.StringLong("padding", 'p', "X", "value: Padding byte")
-	help := getopt.BoolLong("help", 'h', "Help")
+	compress_threshold := getopt.IntLong("threshold", 't', 100, "Compression Threshold (1-100)%")
+	default_align := getopt.IntLong("align", 'a', 0, "Padding alignment 0=small/slow 6=fast/large")
+	padding := getopt.StringLong("padding", 'p', "X", "Padding byte")
+	help := getopt.BoolLong("help", 'h', "Display this help and exit")
 
 	getopt.ParseV2()
 
@@ -52,22 +52,22 @@ func parse_args() (int, string, string) {
 		os.Exit(0)
 	}
 
-	if (*level > 9) && (*level < 0) {
-		fmt.Printf("ERROR: out of bounds value for compress!!!\n\n")
+	if (*level > 9) || (*level < -1) {
+		fmt.Printf("ERROR: out of bounds value for compression depth level!!!\n\n")
 		getopt.Usage()
-		os.Exit(1)
+		os.Exit(-1)
 	}
 
-	if (*compress_threshold > 100) && (*compress_threshold < 0) {
+	if (*compress_threshold > 100) || (*compress_threshold < 0) {
 		fmt.Printf("ERROR: out of bounds value for threshold!!!\n\n")
 		getopt.Usage()
-		os.Exit(1)
+		os.Exit(-1)
 	}
 
 	if (args < 1) || (args > 2) {
 		fmt.Printf("ERROR: Invalid amount of input and output file parameters!!!\n\n")
 		getopt.Usage()
-		os.Exit(1)
+		os.Exit(-1)
 	}
 
 	if len(*padding) == 1 {
@@ -75,7 +75,7 @@ func parse_args() (int, string, string) {
 	} else {
 		fmt.Printf("ERROR: Invalid padding character!!!\n\n")
 		getopt.Usage()
-		os.Exit(1)
+		os.Exit(-1)
 	}
 
 	if args == 1 {
@@ -88,7 +88,7 @@ func parse_args() (int, string, string) {
 		} else {
 			fmt.Printf("ERROR: Invalid file extension!!!\n\n")
 			getopt.Usage()
-			os.Exit(1)
+			os.Exit(-1)
 		}
 	}
 
@@ -106,7 +106,22 @@ func parse_args() (int, string, string) {
 		}
 	}
 
-	return *level, fname_in, fname_out
+	var uncompress lz4.CompressionLevel = 0xFFFFFFFF
+
+	compress_level := []lz4.CompressionLevel{
+		uncompress,
+		lz4.Fast,
+		lz4.Level1,
+		lz4.Level2,
+		lz4.Level3,
+		lz4.Level4,
+		lz4.Level5,
+		lz4.Level6,
+		lz4.Level7,
+		lz4.Level8,
+		lz4.Level9}
+
+	return compress_level[*level+1], fname_in, fname_out
 }
 
 func open_input_output(fname_in string, fname_out string) (*os.File, *os.File) {
@@ -183,27 +198,31 @@ func pack(int_byte int32) []byte {
 	return buf.Bytes()
 }
 
-func show_comp_info(fname_in string, fname_out string, total_bytes int64, block_size int, align int, level int) {
+func show_comp_info(fname_in string, fname_out string, total_bytes int64, block_size int, align int, level lz4.CompressionLevel) {
 	fmt.Printf("Compress '%s' to '%s'\n", fname_in, fname_out)
 	fmt.Printf("Total File Size: %d bytes\n", total_bytes)
 	fmt.Printf("Block size: 	 %d bytes\n", block_size)
 	fmt.Printf("Index Align: 	 %d\n", (1 << align))
-	fmt.Printf("Compress level:  %d\n", level)
+	fmt.Printf("Compress level:  %s\n", level.String())
 
 }
 
 func set_align(fout *os.File, write_pos int64, align int) int64 {
-	if (write_pos % (1 << align)) == 0 {
-		align_len := (1 << align) - write_pos%(1<<align)
+	if (write_pos % (1 << align)) != 0 {
+		align_len := (1 << align) - (write_pos % (1 << align))
 		padding := make([]byte, align_len)
+
 		for j := range padding {
 			padding[j] = DEFAULT_PADDING
 		}
+
 		fout.Write(padding)
 		var pad = make([]byte, align_len)
+
 		for i := range pad {
 			pad[i] = DEFAULT_PADDING
 		}
+
 		fout.Write(pad)
 		write_pos += align_len
 	}
@@ -211,7 +230,7 @@ func set_align(fout *os.File, write_pos int64, align int) int64 {
 	return write_pos
 }
 
-func compress_zso(fname_in string, fname_out string, level int) {
+func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel) {
 	fin, fout := open_input_output(fname_in, fname_out)
 
 	file_stat, err := fin.Stat()
@@ -254,9 +273,21 @@ func compress_zso(fname_in string, fname_out string, level int) {
 	iso_data := make([]byte, block_size)
 
 	var c lz4.CompressorHC
-	c.Level = lz4.CompressionLevel(level)
+	c.Level = level
+	fmt.Printf("Compression level: %s\n", c.Level.String())
 
 	for block < total_block {
+
+		percent_cnt++
+
+		if percent_cnt >= int64(percent_period) && percent_period != 0 {
+			if block == 0 {
+				fmt.Printf("Compress %3d average rate %3d\r", (block / int64(percent_period)), 0)
+			} else {
+				fmt.Printf("Compress %3d average rate %3d\r", (block / int64(percent_period)), 100*write_pos/(block*0x800))
+			}
+		}
+
 		_, err := fin.Read(iso_data)
 		if err != nil && err != io.EOF {
 			panic(err)
@@ -315,6 +346,9 @@ func decompress_zso(fname_in string, fname_out string) {
 
 	total_block := total_bytes / int64(block_size)
 
+	fmt.Println(align)
+	fmt.Println(total_block)
+
 	fin.Close()
 	fout.Close()
 }
@@ -323,7 +357,7 @@ func main() {
 	fmt.Printf("ziso-go %s by %s\n", __version__, __author__)
 	level, fname_in, fname_out := parse_args()
 
-	if level == 0 {
+	if level == 0xFFFFFFFF {
 		decompress_zso(fname_in, fname_out)
 	} else {
 		compress_zso(fname_in, fname_out, level)
