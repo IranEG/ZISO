@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -10,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/pborman/getopt/v2"
-	"github.com/pierrec/lz4"
+	"github.com/pierrec/lz4/v4"
 )
 
 const __version__ = "1.0"
@@ -101,7 +100,21 @@ func parse_args() (int, string, string) {
 	return level, fname_in, fname_out
 }
 
-func generate_zso_header(magic int, header_size int, total_bytes int64, block_size int, ver int, align int64) []byte {
+func open_input_output(fname_in string, fname_out string) (*os.File, *os.File) {
+	fin, err := os.Open(fname_in)
+	if err != nil {
+		panic(err)
+	}
+
+	fout, err := os.Create(fname_out)
+	if err != nil {
+		panic(err)
+	}
+
+	return fin, fout
+}
+
+func generate_zso_header(magic int, header_size int, total_bytes int64, block_size int, ver int, align int) []byte {
 	type packet struct {
 		_magic       uint32
 		_header_size uint32
@@ -121,7 +134,20 @@ func generate_zso_header(magic int, header_size int, total_bytes int64, block_si
 	return buf.Bytes()
 }
 
-func show_comp_info(fname_in string, fname_out string, total_bytes int64, block_size int, align int64, level int) {
+func pack(int_byte int32) []byte {
+	type packet struct {
+		_int_byte uint32
+	}
+
+	dataIn := packet{_int_byte: uint32(int_byte)}
+	buf := new(bytes.Buffer)
+
+	binary.Write(buf, binary.LittleEndian, dataIn)
+
+	return buf.Bytes()
+}
+
+func show_comp_info(fname_in string, fname_out string, total_bytes int64, block_size int, align int, level int) {
 	fmt.Printf("Compress '%s' to '%s'\n", fname_in, fname_out)
 	fmt.Printf("Total File Size: %d bytes\n", total_bytes)
 	fmt.Printf("Block size: 	 %d bytes\n", block_size)
@@ -130,28 +156,27 @@ func show_comp_info(fname_in string, fname_out string, total_bytes int64, block_
 
 }
 
+func set_align(fout *os.File, write_pos int64, align int) int64 {
+	if (write_pos % (1 << align)) == 0 {
+		align_len := (1 << align) - write_pos%(1<<align)
+		padding := make([]byte, align_len)
+		for j := range padding {
+			padding[j] = DEFAULT_PADDING
+		}
+		fout.Write(padding)
+		var pad = make([]byte, align_len)
+		for i := range pad {
+			pad[i] = DEFAULT_PADDING
+		}
+		fout.Write(pad)
+		write_pos += align_len
+	}
+
+	return write_pos
+}
+
 func compress_zso(fname_in string, fname_out string, level int) {
-	fin, err := os.Open(fname_in)
-	if err != nil {
-		panic(err)
-	}
-
-	defer func() {
-		if err := fin.Close(); err != nil {
-			panic(err)
-		}
-	}()
-
-	fout, err := os.Create(fname_out)
-	if err != nil {
-		panic(err)
-	}
-
-	defer func() {
-		if err := fout.Close(); err != nil {
-			panic(err)
-		}
-	}()
+	fin, fout := open_input_output(fname_in, fname_out)
 
 	file_stat, err := fin.Stat()
 	if err != nil {
@@ -159,11 +184,9 @@ func compress_zso(fname_in string, fname_out string, level int) {
 	}
 	total_bytes := file_stat.Size()
 
-	fmt.Printf("File Size: %d bytes\n", total_bytes)
+	magic, header_size, block_size, ver, align := ZISO_MAGIC, 0x18, 0x800, 1, DEFAULT_ALIGN
 
-	magic, header_size, block_size, ver, align := ZISO_MAGIC, 0x18, 0x800, 1, int64(DEFAULT_ALIGN)
-
-	align = total_bytes / 0x80000000
+	align = int(total_bytes) / 0x80000000
 
 	header := generate_zso_header(magic, header_size, total_bytes, block_size, ver, align)
 
@@ -172,19 +195,78 @@ func compress_zso(fname_in string, fname_out string, level int) {
 	total_block := total_bytes / int64(block_size)
 
 	var index_buf = make([]int, total_block+1)
+	var blank_bytes = make([]byte, len(index_buf)*4)
 
-	for i, s := range index_buf {
-		fout.Write([]byte{0x00, 0x00, 0x00, 0x00})
-		fmt.Printf("%d %d\n", i, s)
-	}
+	fout.Write(blank_bytes)
 
 	show_comp_info(fname_in, fname_out, total_bytes, block_size, align, level)
 
+	write_pos, err := fout.Seek(0, io.SeekCurrent)
+	if err != nil {
+		panic(err)
+	}
+
+	percent_period := float64(total_block) / 100
+	percent_cnt := int64(0)
+
+	var block int64 = 0
+
+	fmt.Printf("total_block: %d\n", total_block)
+	fmt.Printf("percent_period: %f\n", percent_period)
+	fmt.Printf("percent_cnt: %d\n", percent_cnt)
+
+	iso_data := make([]byte, block_size)
+
+	var c lz4.CompressorHC
+	c.Level = lz4.CompressionLevel(level)
+
+	for block < total_block {
+		_, err := fin.Read(iso_data)
+		if err != nil && err != io.EOF {
+			panic(err)
+		}
+
+		zso_data := make([]byte, block_size)
+
+		n, err := c.CompressBlock(iso_data, zso_data)
+
+		if err != nil {
+			fmt.Println("Compressed data does not fit in zso_data")
+			panic(err)
+		}
+
+		write_pos = set_align(fout, write_pos, align)
+		index_buf[block] = int(write_pos) >> align
+
+		if n == 0 {
+			zso_data = iso_data
+			index_buf[block] |= 0x80000000
+		} else if (index_buf[block] & 0x80000000) > 0 {
+			fmt.Printf("Align error, you have to increase align by 1 or CFW won't be able to read offset above 2 ** 31 bytes")
+			os.Exit(1)
+		} else {
+			zso_data = zso_data[:n]
+		}
+
+		fout.Write(zso_data)
+		write_pos += int64(len(zso_data))
+		block++
+	}
+
+	index_buf[block] = int(write_pos) >> int(align)
+	fout.Seek(int64(len(header)), 0)
+
+	for i := range index_buf {
+		idx := pack(int32(index_buf[i]))
+		fout.Write(idx)
+	}
+
+	fin.Close()
+	fout.Close()
+
 }
 
-func decompress_zso(fname_in, fname_out) {
-
-}
+func decompress_zso(fname_in string, fname_out string)
 
 func main() {
 	fmt.Printf("ziso-go %s by %s\n", __version__, __author__)
@@ -194,120 +276,5 @@ func main() {
 		decompress_zso(fname_in, fname_out)
 	} else {
 		compress_zso(fname_in, fname_out, level)
-	}
-
-	fmt.Println(level)
-	fmt.Println(fname_in)
-	fmt.Println(fname_out)
-	fmt.Println(*MP)
-	fmt.Println(*COMPRESS_THRESHOLD)
-	fmt.Println(*DEFAULT_ALIGN)
-	fmt.Println(DEFAULT_PADDING)
-	fmt.Printf("0x%X\n", ZISO_MAGIC)
-
-	//compress(os.Args[1], os.Args[2])
-	//decompress(os.Args[2], "decompress.txt")
-}
-
-// ====================================================================================//
-func compress(inputFile, outputFile string) {
-	// open input file
-	fin, err := os.Open(inputFile)
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		if err := fin.Close(); err != nil {
-			panic(err)
-		}
-	}()
-	// make a read buffer
-	r := bufio.NewReader(fin)
-
-	// open output file
-	fout, err := os.Create(outputFile)
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		if err := fout.Close(); err != nil {
-			panic(err)
-		}
-	}()
-	// make an lz4 write buffer
-	w := lz4.NewWriter(fout)
-
-	// make a buffer to keep chunks that are read
-	buf := make([]byte, 1024)
-	for {
-		// read a chunk
-		n, err := r.Read(buf)
-		if err != nil && err != io.EOF {
-			panic(err)
-		}
-		if n == 0 {
-			break
-		}
-
-		// write a chunk
-		if _, err := w.Write(buf[:n]); err != nil {
-			panic(err)
-		}
-	}
-
-	if err = w.Flush(); err != nil {
-		panic(err)
-	}
-}
-
-func decompress(inputFile, outputFile string) {
-	// open input file
-	fin, err := os.Open(inputFile)
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		if err := fin.Close(); err != nil {
-			panic(err)
-		}
-	}()
-
-	// make an lz4 read buffer
-	r := lz4.NewReader(fin)
-
-	// open output file
-	fout, err := os.Create(outputFile)
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		if err := fout.Close(); err != nil {
-			panic(err)
-		}
-	}()
-
-	// make a write buffer
-	w := bufio.NewWriter(fout)
-
-	// make a buffer to keep chunks that are read
-	buf := make([]byte, 1024)
-	for {
-		// read a chunk
-		n, err := r.Read(buf)
-		if err != nil && err != io.EOF {
-			panic(err)
-		}
-		if n == 0 {
-			break
-		}
-
-		// write a chunk
-		if _, err := w.Write(buf[:n]); err != nil {
-			panic(err)
-		}
-	}
-
-	if err = w.Flush(); err != nil {
-		panic(err)
 	}
 }
