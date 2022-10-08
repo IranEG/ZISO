@@ -210,6 +210,7 @@ func show_comp_info(fname_in string, fname_out string, total_bytes int64, block_
 func set_align(fout *os.File, write_pos int64, align int) int64 {
 	if (write_pos % (1 << align)) != 0 {
 		align_len := (1 << align) - (write_pos % (1 << align))
+
 		padding := make([]byte, align_len)
 
 		for j := range padding {
@@ -217,13 +218,6 @@ func set_align(fout *os.File, write_pos int64, align int) int64 {
 		}
 
 		fout.Write(padding)
-		var pad = make([]byte, align_len)
-
-		for i := range pad {
-			pad[i] = DEFAULT_PADDING
-		}
-
-		fout.Write(pad)
 		write_pos += align_len
 	}
 
@@ -242,6 +236,8 @@ func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel)
 	magic, header_size, block_size, ver, align := ZISO_MAGIC, 0x18, 0x800, 1, DEFAULT_ALIGN
 
 	align = int(total_bytes) / 0x80000000
+
+	fmt.Printf("align: %d\n", align)
 
 	header := generate_zso_header(magic, header_size, total_bytes, block_size, ver, align)
 
@@ -266,15 +262,10 @@ func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel)
 
 	var block int64 = 0
 
-	fmt.Printf("total_block: %d\n", total_block)
-	fmt.Printf("percent_period: %f\n", percent_period)
-	fmt.Printf("percent_cnt: %d\n", percent_cnt)
-
 	iso_data := make([]byte, block_size)
 
 	var c lz4.CompressorHC
 	c.Level = level
-	fmt.Printf("Compression level: %s\n", c.Level.String())
 
 	for block < total_block {
 
