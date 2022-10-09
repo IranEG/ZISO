@@ -150,7 +150,7 @@ func generate_zso_header(magic int, header_size int, total_bytes int64, block_si
 		_pad_byte2   byte
 	}
 
-	dataIn := packet{_magic: uint32(magic), _header_size: uint32(header_size), _total_bytes: uint64(total_bytes), _block_size: uint32(block_size), _ver: byte(ver), _align: byte(align)}
+	dataIn := packet{_magic: uint32(magic), _header_size: uint32(header_size), _total_bytes: uint64(total_bytes), _block_size: uint32(block_size), _ver: byte(ver), _align: byte(align), _pad_byte1: 0x00, _pad_byte2: 0x00}
 	buf := new(bytes.Buffer)
 
 	binary.Write(buf, binary.LittleEndian, dataIn)
@@ -186,16 +186,19 @@ func read_zso_header(fin *os.File) (int, int, int64, int, int, int) {
 }
 
 func pack(int_byte int32) []byte {
-	type packet struct {
-		_int_byte uint32
-	}
 
-	dataIn := packet{_int_byte: uint32(int_byte)}
 	buf := new(bytes.Buffer)
-
-	binary.Write(buf, binary.LittleEndian, dataIn)
+	binary.Write(buf, binary.LittleEndian, int_byte)
 
 	return buf.Bytes()
+}
+
+func unpack(in_bytes []byte) int32 {
+	var index_bytes int32
+
+	buf := bytes.NewReader(in_bytes)
+	binary.Read(buf, binary.LittleEndian, &index_bytes)
+	return index_bytes
 }
 
 func show_comp_info(fname_in string, fname_out string, total_bytes int64, block_size int, align int, level lz4.CompressionLevel) {
@@ -205,6 +208,14 @@ func show_comp_info(fname_in string, fname_out string, total_bytes int64, block_
 	fmt.Printf("Index Align: 	 %d\n", (1 << align))
 	fmt.Printf("Compress level:  %s\n", level.String())
 
+}
+
+func show_zso_info(fname_in string, fname_out string, total_bytes int64, block_size int, total_block int64, align int) {
+	fmt.Printf("Decompress '%s' to '%s'\n", fname_in, fname_out)
+	fmt.Printf("Total file size: %d bytes\n", total_bytes)
+	fmt.Printf("Block size: 	 %d bytes\n", block_size)
+	fmt.Printf("Total blocks: 	 %d blocks\n", total_block)
+	fmt.Printf("Index Align: 	 %d\n", align)
 }
 
 func set_align(fout *os.File, write_pos int64, align int) int64 {
@@ -233,9 +244,9 @@ func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel)
 	}
 	total_bytes := file_stat.Size()
 
-	magic, header_size, block_size, ver, align := ZISO_MAGIC, 0x18, 0x800, 1, DEFAULT_ALIGN
+	magic, header_size, block_size, ver := ZISO_MAGIC, 0x18, 0x800, 1
 
-	align = int(total_bytes) / 0x80000000
+	align := int(total_bytes) / 0x80000000
 
 	fmt.Printf("align: %d\n", align)
 
@@ -272,10 +283,11 @@ func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel)
 		percent_cnt++
 
 		if percent_cnt >= int64(percent_period) && percent_period != 0 {
+			percent_cnt = 0
 			if block == 0 {
-				fmt.Printf("Compress %3d average rate %3d\r", (block / int64(percent_period)), 0)
+				fmt.Printf("Compress %3d%% average rate %3d%%\r", (block / int64(percent_period)), 0)
 			} else {
-				fmt.Printf("Compress %3d average rate %3d\r", (block / int64(percent_period)), 100*write_pos/(block*0x800))
+				fmt.Printf("Compress %3d%% average rate %3d%%\r", (block / int64(percent_period)), 100*write_pos/(block*0x800))
 			}
 		}
 
@@ -299,7 +311,7 @@ func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel)
 		if n == 0 {
 			zso_data = iso_data
 			index_buf[block] |= 0x80000000
-		} else if (index_buf[block] & 0x80000000) > 0 {
+		} else if (index_buf[block] & 0x80000000) != 0 {
 			fmt.Printf("Align error, you have to increase align by 1 or CFW won't be able to read offset above 2 ** 31 bytes")
 			os.Exit(1)
 		} else {
@@ -319,6 +331,8 @@ func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel)
 		fout.Write(idx)
 	}
 
+	fmt.Printf("ZISO compression completed. Total size = %d bytes, rate %d%%\n", write_pos, (write_pos * 100 / total_bytes))
+
 	fin.Close()
 	fout.Close()
 
@@ -337,11 +351,71 @@ func decompress_zso(fname_in string, fname_out string) {
 
 	total_block := total_bytes / int64(block_size)
 
-	fmt.Println(align)
-	fmt.Println(total_block)
+	var index_buf = make([]int, total_block+1)
+
+	var index_bytes = make([]byte, 4)
+
+	for i := range index_buf {
+		fin.Read(index_bytes)
+		index_buf[i] = int(unpack(index_bytes))
+	}
+
+	show_zso_info(fname_in, fname_out, total_bytes, block_size, total_block, align)
+
+	percent_period := float64(total_block) / 100
+	percent_cnt := int64(0)
+
+	var block int64 = 0
+
+	for block < total_block {
+		percent_cnt++
+		if percent_cnt >= int64(percent_period) && percent_period != 0 {
+			percent_cnt = 0
+			fmt.Printf("Decompressing: %d%%\r", (block / int64(percent_period)))
+		}
+
+		index := index_buf[block]
+		plain := index & 0x80000000
+		index &= 0x7fffffff
+		read_pos := index << align
+
+		var read_size int
+
+		if plain != 0 {
+			read_size = block_size
+		} else {
+			index2 := index_buf[block+1] & 0x7fffffff
+			read_size = (index2 - index) << align
+
+			if block == (total_block - 1) {
+				read_size = int(total_bytes) - read_pos
+			}
+		}
+
+		zso_data := seek_and_read(fin, int64(read_pos), read_size)
+
+		iso_data := make([]byte, block_size)
+
+		if plain != 0 {
+			iso_data = zso_data
+		} else {
+			lz4.UncompressBlock(zso_data, iso_data)
+		}
+
+		if len(iso_data) != block_size {
+			fmt.Printf("%d block: 0x%X %d length: %d\n", block, read_pos, read_size, len(iso_data))
+			os.Exit(-1)
+		}
+
+		fout.Write(iso_data)
+		block++
+
+	}
 
 	fin.Close()
 	fout.Close()
+
+	fmt.Println("ZISO decompression completed!")
 }
 
 func main() {
