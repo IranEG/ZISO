@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -238,35 +239,34 @@ func set_align(fout *os.File, write_pos int64, align int) int64 {
 func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel) {
 	fin, fout := open_input_output(fname_in, fname_out)
 
-	file_stat, err := fin.Stat()
-	if err != nil {
-		panic(err)
-	}
+	// Get input file statistics
+	file_stat, _ := fin.Stat()
 	total_bytes := file_stat.Size()
 
+	// Generate header data
 	magic, header_size, block_size, ver := ZISO_MAGIC, 0x18, 0x800, 1
-
 	align := int(total_bytes) / 0x80000000
-
-	fmt.Printf("align: %d\n", align)
-
 	header := generate_zso_header(magic, header_size, total_bytes, block_size, ver, align)
 
-	fout.Write(header)
+	// Create bufio Reader and Writer
+	reader := bufio.NewReader(fin)
+	writer := bufio.NewWriterSize(fout, block_size)
+
+	// Write header information to output file and flush buffer
+	writer.Write(header)
+	writer.Flush()
 
 	total_block := total_bytes / int64(block_size)
+	index_buf := make([]int, total_block+1)
+	blank_bytes := make([]byte, len(index_buf)*4)
 
-	var index_buf = make([]int, total_block+1)
-	var blank_bytes = make([]byte, len(index_buf)*4)
-
-	fout.Write(blank_bytes)
+	// Write blank index buffer to output file
+	writer.Write(blank_bytes)
+	writer.Flush()
 
 	show_comp_info(fname_in, fname_out, total_bytes, block_size, align, level)
 
-	write_pos, err := fout.Seek(0, io.SeekCurrent)
-	if err != nil {
-		panic(err)
-	}
+	write_pos, _ := fout.Seek(0, io.SeekCurrent)
 
 	percent_period := float64(total_block) / 100
 	percent_cnt := int64(0)
@@ -285,13 +285,13 @@ func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel)
 		if percent_cnt >= int64(percent_period) && percent_period != 0 {
 			percent_cnt = 0
 			if block == 0 {
-				fmt.Printf("Compress %3d%% average rate %3d%%\r", (block / int64(percent_period)), 0)
+				fmt.Printf("Compressing %3d%% average rate %3d%%\r", (block / int64(percent_period)), 0)
 			} else {
-				fmt.Printf("Compress %3d%% average rate %3d%%\r", (block / int64(percent_period)), 100*write_pos/(block*0x800))
+				fmt.Printf("Compressing %3d%% average rate %3d%%\r", (block / int64(percent_period)), 100*write_pos/(block*int64(block_size)))
 			}
 		}
+		_, err := reader.Read(iso_data)
 
-		_, err := fin.Read(iso_data)
 		if err != nil && err != io.EOF {
 			panic(err)
 		}
@@ -311,31 +311,38 @@ func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel)
 		if n == 0 {
 			zso_data = iso_data
 			index_buf[block] |= 0x80000000
+			writer.Write(zso_data)
+
 		} else if (index_buf[block] & 0x80000000) != 0 {
 			fmt.Printf("Align error, you have to increase align by 1 or CFW won't be able to read offset above 2 ** 31 bytes")
 			os.Exit(1)
 		} else {
 			zso_data = zso_data[:n]
+			writer.Write(zso_data)
 		}
 
-		fout.Write(zso_data)
+		//writer.Write(zso_data)
+
 		write_pos += int64(len(zso_data))
 		block++
 	}
+	writer.Flush()
+	write_pos, _ = fout.Seek(0, io.SeekCurrent)
 
 	index_buf[block] = int(write_pos) >> int(align)
 	fout.Seek(int64(len(header)), 0)
 
+	var idx []byte
 	for i := range index_buf {
-		idx := pack(int32(index_buf[i]))
-		fout.Write(idx)
+		idx = append(idx, pack(int32(index_buf[i]))...)
 	}
+	writer.Write(idx)
+	writer.Flush()
 
 	fmt.Printf("ZISO compression completed. Total size = %d bytes, rate %d%%\n", write_pos, (write_pos * 100 / total_bytes))
 
 	fin.Close()
 	fout.Close()
-
 }
 
 func decompress_zso(fname_in string, fname_out string) {
