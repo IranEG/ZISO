@@ -268,14 +268,16 @@ func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel)
 
 	write_pos, _ := fout.Seek(0, io.SeekCurrent)
 
+	iso_data := make([]byte, block_size)
 	percent_period := float64(total_block) / 100
 	percent_cnt := int64(0)
 
+	var n int
+	var err error
 	var block int64 = 0
-
-	iso_data := make([]byte, block_size)
-
+	var zso_data []byte
 	var c lz4.CompressorHC
+
 	c.Level = level
 
 	for block < total_block {
@@ -290,15 +292,12 @@ func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel)
 				fmt.Printf("Compressing %3d%% average rate %3d%%\r", (block / int64(percent_period)), 100*write_pos/(block*int64(block_size)))
 			}
 		}
-		_, err := reader.Read(iso_data)
 
-		if err != nil && err != io.EOF {
-			panic(err)
-		}
+		reader.Read(iso_data)
 
-		zso_data := make([]byte, block_size)
+		zso_data = make([]byte, block_size)
 
-		n, err := c.CompressBlock(iso_data, zso_data)
+		n, err = c.CompressBlock(iso_data, zso_data)
 
 		if err != nil {
 			fmt.Println("Compressed data does not fit in zso_data")
@@ -312,23 +311,24 @@ func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel)
 			zso_data = iso_data
 			index_buf[block] |= 0x80000000
 			writer.Write(zso_data)
+			write_pos += int64(len(zso_data))
 
 		} else if (index_buf[block] & 0x80000000) != 0 {
 			fmt.Printf("Align error, you have to increase align by 1 or CFW won't be able to read offset above 2 ** 31 bytes")
 			os.Exit(1)
+
 		} else {
-			zso_data = zso_data[:n]
-			writer.Write(zso_data)
+			writer.Write(zso_data[:n])
+			writer.Flush()
+			write_pos += int64(n)
 		}
 
-		//writer.Write(zso_data)
-
-		write_pos += int64(len(zso_data))
 		block++
 	}
-	writer.Flush()
-	write_pos, _ = fout.Seek(0, io.SeekCurrent)
 
+	writer.Flush()
+
+	write_pos, _ = fout.Seek(0, io.SeekCurrent)
 	index_buf[block] = int(write_pos) >> int(align)
 	fout.Seek(int64(len(header)), 0)
 
@@ -336,6 +336,7 @@ func compress_zso(fname_in string, fname_out string, level lz4.CompressionLevel)
 	for i := range index_buf {
 		idx = append(idx, pack(int32(index_buf[i]))...)
 	}
+
 	writer.Write(idx)
 	writer.Flush()
 
@@ -426,6 +427,7 @@ func decompress_zso(fname_in string, fname_out string) {
 }
 
 func main() {
+
 	fmt.Printf("ziso-go %s by %s\n", __version__, __author__)
 	level, fname_in, fname_out := parse_args()
 
